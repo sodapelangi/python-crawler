@@ -25,6 +25,7 @@ Configure these in Cloud Run:
 
 - `SUPABASE_URL`: Your Supabase project URL
 - `SUPABASE_SERVICE_ROLE_KEY`: Your Supabase service role key
+- `CRAWLER_WORKERS` (optional): Number of background threads used to process crawl jobs (default `2`)
 
 ### Build and Deploy
 
@@ -87,6 +88,15 @@ Content-Type: application/json
   "years": [2025, 2024, 2023],
   "jenis_ids": [8, 10, 11, 19],
   "created_by": "user_uuid"
+}
+```
+
+Returns `202 Accepted` with the crawl job identifier:
+
+```
+{
+  "job_id": "uuid",
+  "status": "queued"
 }
 ```
 
