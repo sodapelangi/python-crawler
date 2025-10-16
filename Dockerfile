@@ -18,7 +18,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY . .
+COPY app.py bpk_scraper.py ./
 
 # Expose port 8080 (Cloud Run default)
 EXPOSE 8080
