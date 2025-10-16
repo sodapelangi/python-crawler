@@ -1,17 +1,20 @@
 # app/scraper.py
-import os, re, time, hashlib, json
+import os, re, time, hashlib
 from datetime import datetime
 from urllib.parse import urljoin, urlencode
 import requests
 from bs4 import BeautifulSoup
+from pdfminer.high_level import extract_text as pdf_extract_text
 
 BASE = "https://peraturan.bpk.go.id"
-HEADERS = {"User-Agent": "RegwatchService/0.1 (polite scraper; contact: noviana.banafitrah@gmail.com)"}
+HEADERS = {"User-Agent": "RegwatchService/0.2 (polite scraper; contact: you@example.com)"}
+
+# Where we store files by default (local). Feel free to map this to a mounted volume or Cloud Storage later.
+REG_BASE_DIR = os.getenv("REG_BASE_DIR", "./downloads/regulations")
 
 # ---------- small utils ----------
 def _clean(s: str) -> str:
-    import re as _re
-    return _re.sub(r"\s+", " ", (s or "")).strip()
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
 def sleep_rate(rate_per_sec: float):
     time.sleep(max(0.001, 1.0 / max(rate_per_sec, 0.1)))
@@ -59,18 +62,63 @@ def normalize_status(s: str) -> str | None:
 LN_RE  = re.compile(r"LN\s*(\d{4})\s*\(([^)]+)\)", re.I)
 TLN_RE = re.compile(r"TLN\s*\(([^)]+)\)", re.I)
 
-def local_pdf_path(outdir: str, jenis: str, tahun: int, nomor: str) -> str:
+# ---------- path helpers ----------
+def reg_paths(jenis: str, tahun: int, nomor: str) -> tuple[str, str]:
+    """Return (pdf_path, md_path) under REG_BASE_DIR/regulations/{jenis}/{tahun}/{nomor}.(pdf|md)"""
     nomor_safe = re.sub(r"[^0-9A-Za-z_-]+", "-", str(nomor)).strip("-").lower()
-    return os.path.normpath(os.path.join(outdir, jenis.upper(), str(tahun), f"{nomor_safe}.pdf"))
+    jenis_up = (jenis or "UNK").upper()
+    base_dir = os.path.join(REG_BASE_DIR, jenis_up, str(tahun))
+    os.makedirs(base_dir, exist_ok=True)
+    pdf_path = os.path.normpath(os.path.join(base_dir, f"{nomor_safe}.pdf"))
+    md_path  = os.path.normpath(os.path.join(base_dir, f"{nomor_safe}.md"))
+    return pdf_path, md_path
 
 def download_pdf_to_local(pdf_url: str, dest_path: str, rate: float = 1.5) -> dict:
-    if not pdf_url: return {"ok": False, "error": "No PDF URL"}
+    if not pdf_url:
+        return {"ok": False, "error": "No PDF URL"}
     sleep_rate(rate)
     r = requests.get(pdf_url, headers=HEADERS, timeout=90)
-    if r.status_code != 200: return {"ok": False, "error": f"HTTP {r.status_code}"}
+    if r.status_code != 200:
+        return {"ok": False, "error": f"HTTP {r.status_code}"}
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    with open(dest_path, "wb") as f: f.write(r.content)
+    with open(dest_path, "wb") as f:
+        f.write(r.content)
     return {"ok": True, "sha256": sha256_bytes(r.content), "bytes": len(r.content), "path": dest_path}
+
+def convert_pdf_to_markdown(pdf_path: str, md_path: str, meta: dict | None = None) -> dict:
+    """
+    Extract text (embedded only) and write a simple Markdown file.
+    If text is empty (likely scanned PDF), write a note.
+    """
+    text = ""
+    try:
+        text = pdf_extract_text(pdf_path) or ""
+    except Exception as e:
+        # write an error note to the md file for debugging
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(f"# Extraction error\n\nEncountered error while reading PDF:\n\n```\n{e}\n```\n")
+        return {"ok": False, "error": str(e), "path": md_path, "bytes": os.path.getsize(md_path)}
+
+    if not text.strip():
+        content = "# No embedded text found\n\nThis PDF appears to be scanned or image-based. OCR is disabled in this service.\n"
+    else:
+        # Basic Markdown scaffold with optional metadata header
+        lines = []
+        if meta:
+            lines.append("---")
+            for k,v in meta.items():
+                if v is None: continue
+                lines.append(f"{k}: {v}")
+            lines.append("---\n")
+        # normalize whitespace, but keep line breaks from pdfminer
+        lines.append("# Extracted Text\n")
+        lines.append(text.strip())
+        content = "\n".join(lines)
+
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    return {"ok": True, "path": md_path, "bytes": os.path.getsize(md_path)}
 
 # ---------- parser helpers ----------
 def find_card_by_heading_text(soup: BeautifulSoup, words: list[str]) -> BeautifulSoup | None:
@@ -204,17 +252,47 @@ def parse_detail_page(html: str, url: str, debug: bool = False) -> dict:
     return data
 
 # ---------- high-level ops ----------
-def run_once(url: str, rate: float = 1.5, download_pdf: bool = False, outdir: str = "./downloads", debug: bool = False) -> dict:
+def run_once(url: str, rate: float = 1.5, download_pdf: bool = False, debug: bool = False) -> dict:
+    """
+    Fetch detail page, parse metadata, and optionally:
+      - download PDF to /regulations/{jenis}/{tahun}/{nomor}.pdf
+      - convert it to /regulations/{jenis}/{tahun}/{nomor}.md
+    """
     resp = fetch(url, rate=rate)
     data = parse_detail_page(resp.text, url, debug=debug)
+
+    pdf_result = None
+    md_result = None
+
     if download_pdf:
-        if data.get("jenis") and data.get("tahun") and data.get("nomor"):
-            p = local_pdf_path(outdir, data["jenis"], int(data["tahun"]), str(data["nomor"]))
+        # If jenis/tahun/nomor missing, we still try to infer from parsed data
+        jenis = data.get("jenis") or "UNK"
+        tahun = data.get("tahun") or datetime.now().year
+        nomor = data.get("nomor") or "unknown"
+
+        pdf_path, md_path = reg_paths(jenis, int(tahun), str(nomor))
+
+        pdf_result = download_pdf_to_local(data.get("pdf_url"), pdf_path, rate=rate)
+        data["pdf_local"] = pdf_result
+
+        # Convert to Markdown only if download succeeded
+        if pdf_result.get("ok"):
+            # small header meta for convenience
+            meta_hdr = {
+                "jenis": jenis,
+                "nomor": nomor,
+                "tahun": tahun,
+                "judul": data.get("judul"),
+                "sumber_ln": data.get("ln"),
+                "sumber_tln": data.get("tln"),
+                "status": data.get("status") or data.get("status_raw"),
+            }
+            md_result = convert_pdf_to_markdown(pdf_path, md_path, meta=meta_hdr)
+            data["md_local"] = md_result
         else:
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            p = os.path.join(outdir, "misc", f"doc_{stamp}.pdf")
-        data["pdf_local"] = download_pdf_to_local(data.get("pdf_url"), p, rate=rate)
-    # strip debug keys for API cleanliness
+            data["md_local"] = {"ok": False, "error": "PDF not downloaded, skipping conversion"}
+
+    # strip debug keys (keep outputs clean)
     data.pop("_debug_rows", None); data.pop("_debug_found_cards", None)
     return data
 
@@ -259,7 +337,7 @@ def crawl_collect(max_items: int = 10, jenis_ids: list[int] | None = None, years
         if not detail_links:
             break
         for link in detail_links:
-            results.append(run_once(link, rate=rate, download_pdf=download_pdf, outdir="./downloads", debug=False))
+            results.append(run_once(link, rate=rate, download_pdf=download_pdf, debug=False))
             total += 1
             if total >= max_items:
                 break
