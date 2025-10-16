@@ -5,8 +5,8 @@ Provides REST endpoints for crawling regulations and storing in Supabase
 """
 
 import os
-import uuid
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
@@ -30,6 +30,9 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+MAX_WORKERS = int(os.getenv("CRAWLER_WORKERS", "2"))
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 STORAGE_BUCKET = "regulations"
 
@@ -201,6 +204,48 @@ def process_single_regulation(detail_url: str, job_id: str, rate: float = 1.5) -
             "url": detail_url
         }
 
+
+def run_crawl_job(job_id: str, max_items: int, jenis_ids: List[int], years: List[int], rate: float) -> None:
+    """Execute the crawl job in the background"""
+    items_crawled = 0
+    items_skipped = 0
+
+    try:
+        update_crawl_job(job_id, {
+            "status": "running",
+            "started_at": datetime.utcnow().isoformat(),
+            "items_crawled": items_crawled,
+            "items_skipped": items_skipped
+        })
+
+        for detail_url in bpk_scraper.crawl_search_results(max_items, jenis_ids, years, rate=rate):
+            result = process_single_regulation(detail_url, job_id, rate=rate)
+
+            if result["status"] == "success":
+                items_crawled += 1
+            elif result["status"] == "skipped":
+                items_skipped += 1
+
+            update_crawl_job(job_id, {
+                "items_crawled": items_crawled,
+                "items_skipped": items_skipped
+            })
+
+        update_crawl_job(job_id, {
+            "status": "completed",
+            "completed_at": datetime.utcnow().isoformat(),
+            "items_crawled": items_crawled,
+            "items_skipped": items_skipped
+        })
+    except Exception as e:
+        error_msg = f"Crawl failed: {str(e)}"
+        print(f"{error_msg}\n{traceback.format_exc()}")
+        update_crawl_job(job_id, {
+            "status": "failed",
+            "completed_at": datetime.utcnow().isoformat()
+        })
+        add_error_to_job(job_id, error_msg)
+
 # --------------------- API Endpoints ---------------------
 
 @app.route("/health", methods=["GET"])
@@ -232,7 +277,7 @@ def start_crawl():
 
         # Create crawl job
         job_data = {
-            "status": "pending",
+            "status": "queued",
             "parameters": {
                 "max_items": max_items,
                 "years": years,
@@ -241,48 +286,17 @@ def start_crawl():
             "total_items": max_items,
             "items_crawled": 0,
             "items_skipped": 0,
-            "created_by": created_by,
-            "started_at": datetime.utcnow().isoformat()
+            "created_by": created_by
         }
 
         result = supabase.table("crawl_jobs").insert(job_data).execute()
         job_id = result.data[0]["id"]
-
-        # Update status to running
-        update_crawl_job(job_id, {"status": "running"})
-
-        # Start crawling
-        items_crawled = 0
-        items_skipped = 0
-
-        for detail_url in bpk_scraper.crawl_search_results(max_items, jenis_ids, years, rate=rate):
-            result = process_single_regulation(detail_url, job_id, rate=rate)
-
-            if result["status"] == "success":
-                items_crawled += 1
-            elif result["status"] == "skipped":
-                items_skipped += 1
-
-            # Update progress
-            update_crawl_job(job_id, {
-                "items_crawled": items_crawled,
-                "items_skipped": items_skipped
-            })
-
-        # Mark job as completed
-        update_crawl_job(job_id, {
-            "status": "completed",
-            "completed_at": datetime.utcnow().isoformat(),
-            "items_crawled": items_crawled,
-            "items_skipped": items_skipped
-        })
+        executor.submit(run_crawl_job, job_id, max_items, jenis_ids, years, rate)
 
         return jsonify({
             "job_id": job_id,
-            "status": "completed",
-            "items_crawled": items_crawled,
-            "items_skipped": items_skipped
-        })
+            "status": "queued"
+        }), 202
 
     except Exception as e:
         error_msg = f"Crawl failed: {str(e)}"
